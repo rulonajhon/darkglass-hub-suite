@@ -3,6 +3,14 @@
   publish = "dist/client"
   functions = "netlify/functions"
 
+[build.environment]
+  # Firebase web app config values (apiKey, etc.) are public client-side
+  # identifiers by design — they are meant to ship in the browser bundle and
+  # are not secrets. Access is controlled by Firebase Security Rules, not by
+  # keeping these values private. They are excluded from Netlify's smart
+  # secrets detection so the build is not blocked by these false positives.
+  SECRETS_SCAN_SMART_DETECTION_OMIT_VALUES = "AIzaSyCkfbHrlTppWGm5Cgag2aJVv2RvEexxaTw,AIzaSyBnTWvcdQZsXsohbrHLBiA3zsMGhVZYPbc"
+
 [[redirects]]
   from = "/*"
   to = "/.netlify/functions/ssr"
