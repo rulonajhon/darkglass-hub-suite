@@ -1,14 +1,20 @@
 [build]
   command = "npm run build"
-  publish = "dist"
+  publish = "dist/client"
 
 [build.environment]
   NODE_VERSION = "20"
 
-# Redirect all routes to index.html for client-side routing
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+# Server-render every route that isn't an existing static asset in dist/client.
+# Netlify serves matching static files first, so /assets/* is delivered directly
+# and all remaining paths fall through to the TanStack Start SSR handler.
 [[redirects]]
   from = "/*"
-  to = "/index.html"
+  to = "/.netlify/functions/ssr"
   status = 200
 
 # Security headers
