@@ -25,6 +25,22 @@ export function isSupabaseConfigured(): boolean {
 let supabaseAccessToken: string | null = null;
 let tokenExpiresAt = 0; // unix seconds
 
+// Supabase eagerly resolves a WebSocket constructor while building the client.
+// During SSR on Node < 22 there is no global WebSocket, so createClient throws
+// ("Node.js 20 detected without native WebSocket support") and crashes the
+// server-rendered function. We never use Supabase Realtime (Firebase owns
+// realtime), so we hand the client an explicit transport: the native WebSocket
+// in the browser, and a no-op stub on the server. Providing `transport` makes
+// supabase-js skip the WebSocket detection that would otherwise throw. The stub
+// is never instantiated because no Realtime channels are ever subscribed.
+const RealtimeTransport = (typeof WebSocket !== "undefined"
+  ? WebSocket
+  : (class {
+      constructor() {
+        throw new Error("Supabase Realtime is not available in this environment.");
+      }
+    })) as typeof WebSocket;
+
 // Single shared client. We override the Authorization header per request via
 // the global fetch wrapper so we always send the freshest minted token.
 export const supabase: SupabaseClient = createClient(
@@ -35,6 +51,9 @@ export const supabase: SupabaseClient = createClient(
       persistSession: false,    // Firebase owns the session, not Supabase
       autoRefreshToken: false,
       detectSessionInUrl: false,
+    },
+    realtime: {
+      transport: RealtimeTransport,
     },
     global: {
       fetch: (input, init = {}) => {
