@@ -49,7 +49,7 @@ import {
 } from "@/lib/supabase/partDailyReportEbay";
 import { LOCATIONS } from "@/lib/locations";
 import { getTruckStock, type TruckStockStatus } from "@/lib/supabase/truckStock";
-import { allocateOnEbay, ebayPartKey, ebayStockKey, singleEbayRowByPart } from "@/lib/supabase/truckStockEbay";
+import { allocateOnEbay, ebayPartFirst, ebayPartKey, ebayStockKey, indexStockForEbay, matchListingRows } from "@/lib/supabase/truckStockEbay";
 import { branchMatchKey } from "@/lib/branchName";
 import { EbayImportModal } from "@/components/EbayImportModal";
 import { localISODate, todayISO } from "@/lib/localDate";
@@ -817,22 +817,28 @@ export function PartsDailyReportEbay({ mod, sub }: { mod: ModuleDef; sub: SubMod
   // IN STOCK and EBAY rows by part # — the branches the Add Listing form
   // offers (EBAY rows are the units set aside for eBay); every row by part #
   // for "where is it, then?" when a listing's branch has none.
+  // Both by the exact part # and by the first word of the Part # cell, so
+  // "5304531011" also finds Columbus's "5304531011 HEATER" (0481).
   const { stockByPart, allByPart } = useMemo(() => {
     const listable = new Map<string, StockLite[]>();
     const every = new Map<string, StockLite[]>();
+    const push = (m: Map<string, StockLite[]>, k: string, r: StockLite) => {
+      if (!m.has(k)) m.set(k, []);
+      m.get(k)!.push(r);
+    };
     for (const r of stockRows ?? []) {
       const pk = ebayPartKey(r.partNo);
       if (!pk) continue;
-      if (!every.has(pk)) every.set(pk, []);
-      every.get(pk)!.push(r);
+      const fw = ebayPartFirst(r.partNo);
+      const keys = fw && fw !== pk ? [pk, fw] : [pk];
+      for (const k of keys) push(every, k, r);
       if (r.status !== "in_stock" && r.status !== "ebay") continue;
-      if (!listable.has(pk)) listable.set(pk, []);
-      listable.get(pk)!.push(r);
+      for (const k of keys) push(listable, k, r);
     }
     return { stockByPart: listable, allByPart: every };
   }, [stockRows]);
-  // The part's one EBAY row at any branch — a listing's fallback when its branch has no row (0480).
-  const ebayRowByPart = useMemo(() => singleEbayRowByPart(stockRows ?? []), [stockRows]);
+  // What each listing matches — the same rule a sale uses (0477 / 0480 / 0481).
+  const stockIndex = useMemo(() => indexStockForEbay(stockRows ?? []), [stockRows]);
   // Units Listed on eBay per branch + part # (every Listed listing, any date).
   const onEbayByKey = useMemo(() => {
     const map = new Map<string, number>();
@@ -846,15 +852,15 @@ export function PartsDailyReportEbay({ mod, sub }: { mod: ModuleDef; sub: SubMod
   const onEbayByRow = useMemo(() => allocateOnEbay(stockRows ?? [], onEbayByKey), [stockRows, onEbayByKey]);
   /**
    * The Truck Stock row a listing is for — the same row Sold takes from (0477 /
-   * 0480): its own branch's row, else the part's one EBAY row at another
-   * branch (`elsewhere`). null when neither.
+   * 0480 / 0481): its branch's row for the part # (or the part # with a
+   * description, "5304531011 HEATER"), else the part's one EBAY row at
+   * another branch (`elsewhere`). null when none.
    */
   const stockMatchFor = (l: { branch: string; partNo: string }): (StockMatch & { elsewhere: boolean }) | null => {
-    const key = ebayStockKey(l.branch, l.partNo);
-    const own = key ? stockByKey?.get(key) : undefined;
-    if (own) return { ...own, elsewhere: false };
-    const other = ebayRowByPart.get(ebayPartKey(l.partNo));
-    return other ? { ...other, elsewhere: true } : null;
+    if (!stockRows) return null;
+    const m = matchListingRows(stockIndex, ebayStockKey(l.branch, l.partNo));
+    const r = m.rows[0];
+    return r ? { id: r.id, branch: r.branch, partNo: r.partNo, quantity: r.quantity, elsewhere: m.elsewhere } : null;
   };
   /** Branches that have this part in stock, when the listing's own branch doesn't — "Not at Columbus · at Tallahassee 1, …". */
   const stockElsewhereText = (l: { branch: string; partNo: string }): string => {
@@ -2450,7 +2456,11 @@ export function PartsDailyReportEbay({ mod, sub }: { mod: ModuleDef; sub: SubMod
                               key={c.branchKey}
                               type="button"
                               disabled={!ebayBranch}
-                              onClick={() => ebayBranch && setListingDraft((d) => ({ ...d, branch: ebayBranch, partNo: c.partNo, price: applyBranchCents(d.price, ebayBranch) }))}
+                              onClick={() =>
+                                ebayBranch &&
+                                // Keep the part # as typed when the stock row's has a description after it ("5304531011 HEATER").
+                                setListingDraft((d) => ({ ...d, branch: ebayBranch, partNo: ebayPartKey(c.partNo) === ebayPartKey(d.partNo) ? c.partNo : d.partNo, price: applyBranchCents(d.price, ebayBranch) }))
+                              }
                               title={ebayBranch
                                 ? `${c.partNo} at ${c.branch}: ${c.quantity} in stock${c.onEbay ? `, ${c.onEbay} already listed` : ""}${c.storageLocation ? ` · bin ${c.storageLocation}` : ""} — click to list from here`
                                 : `${c.branch} isn't one of the eBay branches (add it on the Assignments tab to list from it)`}

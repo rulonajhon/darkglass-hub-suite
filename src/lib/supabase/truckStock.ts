@@ -8,7 +8,8 @@
  */
 
 import { supabase } from "./client";
-import { availableAfterEbay, ebayStockKey, getOnEbayCounts } from "./truckStockEbay";
+import { allocateOnEbay, availableAfterEbay, ebayPartFirst, getOnEbayCounts } from "./truckStockEbay";
+import { branchMatchKey } from "@/lib/branchName";
 
 /** The workbook's Status list (truckStockOptions.ts, migration 0461) + missing (0478); in_use is from before it — kept, not offered. */
 export type TruckStockStatus = "in_stock" | "in_use" | "sold" | "ebay" | "b2b" | "return" | "ticket" | "used" | "missing";
@@ -31,6 +32,8 @@ export type TruckStockRow = {
   storageLocation: string;
   notes: string;
   status: TruckStockStatus;
+  /** Status set by the database from eBay listings (migration 0482) — read only, never sent. */
+  statusAutoEbay?: boolean;
   createdAt?: string;
   updatedAt?: string;
 };
@@ -46,6 +49,7 @@ function fromDb(r: any): TruckStockRow {
     storageLocation: r.storage_location ?? "",
     notes: r.notes ?? "",
     status: toTruckStockStatus(r.status),
+    statusAutoEbay: r.status_auto_ebay === true,
     createdAt: r.created_at ?? undefined,
     updatedAt: r.updated_at ?? undefined,
   };
@@ -520,11 +524,10 @@ export async function decrementTruckStock(args: {
   if (readErr) throw new Error(readErr.message);
   if (!row) throw new Error(`No truck stock row for ${args.partNo} at ${args.branch}.`);
   const current = Number(row.quantity ?? 0);
-  // Units Listed on eBay (0477) stay on the shelf but can't be pulled.
-  const onEbay = Math.min(
-    current,
-    (await getOnEbayCounts().catch(() => new Map<string, number>())).get(ebayStockKey(args.branch, args.partNo)) ?? 0,
-  );
+  // Units Listed on eBay (0477) stay on the shelf but can't be pulled — this
+  // branch's listings, matched to its rows the way a sale is (0481: "5304531011"
+  // listed counts against "5304531011 HEATER").
+  const onEbay = await onEbayForRow(row.id, args.branch, args.partNo, current);
   if (current - onEbay < qty) {
     throw new Error(
       onEbay > 0
@@ -539,6 +542,29 @@ export async function decrementTruckStock(args: {
     .eq("id", row.id);
   if (updErr) throw new Error(updErr.message);
   return { newQuantity: next, storageLocation: row.storage_location ?? "" };
+}
+
+/** Units of one stock row held by this branch's eBay listings (0 when that can't be read). */
+async function onEbayForRow(rowId: string, branch: string, partNo: string, quantity: number): Promise<number> {
+  try {
+    const counts = await getOnEbayCounts();
+    const prefix = `${branchMatchKey(branch)}|`;
+    const here = new Map([...counts].filter(([k]) => k.startsWith(prefix)));
+    if (here.size === 0) return 0;
+    // The rows at this branch a listing could be for: this part # and "this part # + description".
+    const first = (ebayPartFirst(partNo) || partNo.trim()).replace(/[%_\\]/g, "");
+    const { data, error } = await supabase
+      .from("truck_stock")
+      .select("id, branch, part_no, quantity, status")
+      .ilike("branch", branch.trim())
+      .ilike("part_no", `${first}%`);
+    if (error) throw new Error(error.message);
+    const rows = (data ?? []).map((r: any) => ({ id: r.id, branch: r.branch ?? "", partNo: r.part_no ?? "", quantity: Number(r.quantity ?? 0), status: toTruckStockStatus(r.status) }));
+    if (!rows.some((r) => r.id === rowId)) rows.push({ id: rowId, branch, partNo, quantity, status: "in_stock" });
+    return Math.min(quantity, allocateOnEbay(rows, here).get(rowId) ?? 0);
+  } catch {
+    return 0;
+  }
 }
 
 /**

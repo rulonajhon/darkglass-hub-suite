@@ -1303,8 +1303,22 @@ function BranchSection({
                   <td className="px-3 py-2">{row.manufacturer || "—"}</td>
                   <td className="px-3 py-2 text-right font-semibold">{row.quantity}</td>
                   {ebayCells}
-                  <td className="px-3 py-2">
-                    <OptionChip option={truckStockStatusOption(row.status)} />
+                  <td className="px-3 py-2 whitespace-nowrap">
+                    {row.statusAutoEbay ? (
+                      <span
+                        className="inline-flex items-center gap-1"
+                        title={
+                          row.status === "sold"
+                            ? "Set automatically: every unit listed on eBay sold. Undo on the eBay page brings it back."
+                            : "Set automatically: every unit is listed on eBay. It goes back to IN STOCK when a listing is Ended or Undone."
+                        }
+                      >
+                        <OptionChip option={truckStockStatusOption(row.status)} />
+                        <span className="text-[9px] font-semibold uppercase tracking-wide text-violet-300">auto</span>
+                      </span>
+                    ) : (
+                      <OptionChip option={truckStockStatusOption(row.status)} />
+                    )}
                   </td>
                   <td className="px-3 py-2">
                     {elsewhere.length === 0 ? (
