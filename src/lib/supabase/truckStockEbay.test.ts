@@ -40,6 +40,26 @@ describe("allocateOnEbay", () => {
     expect(got.has("z")).toBe(false);
   });
 
+  it("a listing with no row at its branch goes to the part's one EBAY row elsewhere (0480)", () => {
+    // 5304531011 listed under Columbus (Qty 2); the unit for eBay is Chattanooga's EBAY row.
+    const onEbay = new Map([[ebayStockKey("Columbus", "5304531011"), 2]]);
+    const got = allocateOnEbay(
+      [row("ch", "Chattanooga", "5304531011", 1, "ebay"), row("ta", "Tallahassee", "5304531011", 1), row("ja", "Jacksonville", "5304531011", 1)],
+      onEbay,
+    );
+    expect(got.get("ch")).toBe(1);
+    expect(got.has("ta")).toBe(false);
+    expect(got.has("ja")).toBe(false);
+  });
+
+  it("never guesses between two EBAY rows, and a same-branch row still wins", () => {
+    const twoEbay = allocateOnEbay([row("a", "Jackson, MS", "P", 1, "ebay"), row("b", "Chattanooga", "P", 1, "ebay")], new Map([[ebayStockKey("Columbus", "P"), 1]]));
+    expect(twoEbay.size).toBe(0);
+    const own = allocateOnEbay([row("c", "Columbus", "P", 2), row("d", "Chattanooga", "P", 1, "ebay")], new Map([[ebayStockKey("Columbus", "P"), 1]]));
+    expect(own.get("c")).toBe(1);
+    expect(own.has("d")).toBe(false);
+  });
+
   it("returns nothing when nothing is listed", () => {
     expect(allocateOnEbay([row("a", "Mobile", "W1", 3)], new Map()).size).toBe(0);
   });

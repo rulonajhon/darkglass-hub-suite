@@ -45,10 +45,31 @@ export async function getOnEbayCounts(): Promise<Map<string, number>> {
 type StockLike = Pick<TruckStockRow, "id" | "branch" | "partNo" | "quantity" | "status">;
 
 /**
+ * The part's one EBAY-status row at any branch (part # key → row), for parts
+ * that have exactly one — what a listing falls back to when its own branch
+ * has no row for the part (0480: e.g. listed under Columbus, the unit for
+ * eBay is Chattanooga's EBAY row). Parts with two or more are left out: no guessing.
+ */
+export function singleEbayRowByPart<T extends StockLike>(rows: T[]): Map<string, T> {
+  const seen = new Map<string, T | null>();
+  for (const r of rows) {
+    if (r.status !== "ebay") continue;
+    const pk = ebayPartKey(r.partNo);
+    if (!pk) continue;
+    seen.set(pk, seen.has(pk) ? null : r);
+  }
+  const out = new Map<string, T>();
+  for (const [pk, r] of seen) if (r) out.set(pk, r);
+  return out;
+}
+
+/**
  * How many of each row's units are on eBay (row id → units). A branch's
  * part normally has one row; when it has two (spelled two ways), the eBay
  * units go to the IN STOCK row with the most units first — the same row a
- * sale is taken off (0477) — and never more than a row holds.
+ * sale is taken off (0477) — and never more than a row holds. A listing
+ * whose branch has no row for the part goes to the part's one EBAY row at
+ * another branch (0480), when there is exactly one.
  */
 export function allocateOnEbay(rows: StockLike[], onEbay: Map<string, number>): Map<string, number> {
   const out = new Map<string, number>();
@@ -60,15 +81,24 @@ export function allocateOnEbay(rows: StockLike[], onEbay: Map<string, number>): 
     if (!byKey.has(key)) byKey.set(key, []);
     byKey.get(key)!.push(r);
   }
+  const give = (r: StockLike, want: number) => {
+    const take = Math.min(want, Math.max(0, r.quantity - (out.get(r.id) ?? 0)));
+    if (take > 0) out.set(r.id, (out.get(r.id) ?? 0) + take);
+    return take;
+  };
   for (const [key, group] of byKey) {
     let left = onEbay.get(key) ?? 0;
     group.sort((a, b) => Number(b.status === "in_stock") - Number(a.status === "in_stock") || b.quantity - a.quantity);
     for (const r of group) {
       if (left <= 0) break;
-      const take = Math.min(left, Math.max(0, r.quantity));
-      if (take > 0) out.set(r.id, take);
-      left -= take;
+      left -= give(r, left);
     }
+  }
+  const ebayRow = singleEbayRowByPart(rows);
+  for (const [key, units] of onEbay) {
+    if (byKey.has(key)) continue;
+    const r = ebayRow.get(key.slice(key.indexOf("|") + 1));
+    if (r) give(r, units);
   }
   return out;
 }

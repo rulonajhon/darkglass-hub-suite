@@ -48,8 +48,8 @@ import {
   type EbayBranchCent,
 } from "@/lib/supabase/partDailyReportEbay";
 import { LOCATIONS } from "@/lib/locations";
-import { getTruckStock } from "@/lib/supabase/truckStock";
-import { ebayPartKey, ebayStockKey } from "@/lib/supabase/truckStockEbay";
+import { getTruckStock, type TruckStockStatus } from "@/lib/supabase/truckStock";
+import { allocateOnEbay, ebayPartKey, ebayStockKey, singleEbayRowByPart } from "@/lib/supabase/truckStockEbay";
 import { branchMatchKey } from "@/lib/branchName";
 import { EbayImportModal } from "@/components/EbayImportModal";
 import { localISODate, todayISO } from "@/lib/localDate";
@@ -80,9 +80,9 @@ const LISTING_STATUS_TONE: Record<string, string> = {
 
 /** The Truck Stock row a listing is for — same pick as the database (0477): IN STOCK first, then the most units. */
 type StockMatch = { id: string; branch: string; partNo: string; quantity: number };
-type StockLite = StockMatch & { status: string; description: string; manufacturer: string; storageLocation: string };
+type StockLite = StockMatch & { status: TruckStockStatus; description: string; manufacturer: string; storageLocation: string };
 /** One branch's Part Inventory (Truck Stock) for a part # — what the Add forms offer. */
-type StockChoice = { branchKey: string; branch: string; partNo: string; quantity: number; onEbay: number; available: number; description: string; manufacturer: string; storageLocation: string };
+type StockChoice = { branchKey: string; branch: string; partNo: string; quantity: number; onEbay: number; available: number; ebayStock: boolean; description: string; manufacturer: string; storageLocation: string };
 
 const LISTING_FIELD_LABELS: Record<string, string> = {
   partNo: "Part #", ebayAccount: "Account", branch: "Branch", price: "Price", quantity: "Qty", listedDate: "Listed Date", status: "Status",
@@ -814,18 +814,25 @@ export function PartsDailyReportEbay({ mod, sub }: { mod: ModuleDef; sub: SubMod
     }
     return map;
   }, [stockRows]);
-  // IN STOCK rows by part # — the branches the Add Listing form offers.
-  const stockByPart = useMemo(() => {
-    const map = new Map<string, StockLite[]>();
+  // IN STOCK and EBAY rows by part # — the branches the Add Listing form
+  // offers (EBAY rows are the units set aside for eBay); every row by part #
+  // for "where is it, then?" when a listing's branch has none.
+  const { stockByPart, allByPart } = useMemo(() => {
+    const listable = new Map<string, StockLite[]>();
+    const every = new Map<string, StockLite[]>();
     for (const r of stockRows ?? []) {
-      if (r.status !== "in_stock") continue;
       const pk = ebayPartKey(r.partNo);
       if (!pk) continue;
-      if (!map.has(pk)) map.set(pk, []);
-      map.get(pk)!.push(r);
+      if (!every.has(pk)) every.set(pk, []);
+      every.get(pk)!.push(r);
+      if (r.status !== "in_stock" && r.status !== "ebay") continue;
+      if (!listable.has(pk)) listable.set(pk, []);
+      listable.get(pk)!.push(r);
     }
-    return map;
+    return { stockByPart: listable, allByPart: every };
   }, [stockRows]);
+  // The part's one EBAY row at any branch — a listing's fallback when its branch has no row (0480).
+  const ebayRowByPart = useMemo(() => singleEbayRowByPart(stockRows ?? []), [stockRows]);
   // Units Listed on eBay per branch + part # (every Listed listing, any date).
   const onEbayByKey = useMemo(() => {
     const map = new Map<string, number>();
@@ -835,30 +842,45 @@ export function PartsDailyReportEbay({ mod, sub }: { mod: ModuleDef; sub: SubMod
     }
     return map;
   }, [allActiveListings]);
-  const stockMatchFor = (l: { branch: string; partNo: string }): StockMatch | null => {
+  // …and how many of each Truck Stock row that is (same rule as the Truck Stock page).
+  const onEbayByRow = useMemo(() => allocateOnEbay(stockRows ?? [], onEbayByKey), [stockRows, onEbayByKey]);
+  /**
+   * The Truck Stock row a listing is for — the same row Sold takes from (0477 /
+   * 0480): its own branch's row, else the part's one EBAY row at another
+   * branch (`elsewhere`). null when neither.
+   */
+  const stockMatchFor = (l: { branch: string; partNo: string }): (StockMatch & { elsewhere: boolean }) | null => {
     const key = ebayStockKey(l.branch, l.partNo);
-    return (key && stockByKey?.get(key)) || null;
+    const own = key ? stockByKey?.get(key) : undefined;
+    if (own) return { ...own, elsewhere: false };
+    const other = ebayRowByPart.get(ebayPartKey(l.partNo));
+    return other ? { ...other, elsewhere: true } : null;
   };
-  /** Each branch's in-stock units of this part #, with what's already listed taken out — most available first. */
+  /** Branches that have this part in stock, when the listing's own branch doesn't — "Not at Columbus · at Tallahassee 1, …". */
+  const stockElsewhereText = (l: { branch: string; partNo: string }): string => {
+    const rows = (allByPart.get(ebayPartKey(l.partNo)) ?? []).filter((r) => r.quantity > 0 && branchMatchKey(r.branch) !== branchMatchKey(l.branch));
+    return rows.map((r) => `${r.branch} ${r.quantity}${r.status === "in_stock" ? "" : ` (${r.status.toUpperCase()})`}`).join(", ");
+  };
+  /** Each branch's in-stock / eBay units of this part #, with what's already listed taken out — most available first. */
   const stockChoicesFor = (partNo: string): StockChoice[] => {
     const pk = ebayPartKey(partNo);
     if (!pk) return [];
     const byBranch = new Map<string, StockChoice>();
     for (const r of stockByPart.get(pk) ?? []) {
       const bk = branchMatchKey(r.branch);
+      const listedHere = onEbayByRow.get(r.id) ?? 0;
       const have = byBranch.get(bk);
       if (have) {
         have.quantity += r.quantity;
+        have.onEbay += listedHere;
+        have.ebayStock ||= r.status === "ebay";
         if (!have.storageLocation && r.storageLocation) have.storageLocation = r.storageLocation;
       } else {
-        byBranch.set(bk, { branchKey: bk, branch: r.branch, partNo: r.partNo, quantity: r.quantity, onEbay: 0, available: 0, description: r.description, manufacturer: r.manufacturer, storageLocation: r.storageLocation });
+        byBranch.set(bk, { branchKey: bk, branch: r.branch, partNo: r.partNo, quantity: r.quantity, onEbay: listedHere, available: 0, ebayStock: r.status === "ebay", description: r.description, manufacturer: r.manufacturer, storageLocation: r.storageLocation });
       }
     }
     return [...byBranch.values()]
-      .map((c) => {
-        const onEbay = onEbayByKey.get(`${c.branchKey}|${pk}`) ?? 0;
-        return { ...c, onEbay, available: Math.max(0, c.quantity - onEbay) };
-      })
+      .map((c) => ({ ...c, available: Math.max(0, c.quantity - c.onEbay) }))
       .sort((a, b) => b.available - a.available || a.branch.localeCompare(b.branch));
   };
   /** The eBay branch list's spelling of a Truck Stock branch, or undefined when it isn't an eBay branch. */
@@ -1340,7 +1362,7 @@ export function PartsDailyReportEbay({ mod, sub }: { mod: ModuleDef; sub: SubMod
   // The database takes a sale off Truck Stock (unless "Sold only") and puts
   // it back when the listing leaves Sold — this saves the status and shows
   // what it did.
-  const [soldAsk, setSoldAsk] = useState<{ row: EbayListingRow; match: StockMatch } | null>(null);
+  const [soldAsk, setSoldAsk] = useState<{ row: EbayListingRow; match: StockMatch & { elsewhere: boolean } } | null>(null);
   const changeListingStatus = async (row: EbayListingRow, status: EbayListingStatus, opts: { skipStock?: boolean } = {}) => {
     setSavingRowId(row.id);
     setError(null);
@@ -2434,7 +2456,7 @@ export function PartsDailyReportEbay({ mod, sub }: { mod: ModuleDef; sub: SubMod
                                 : `${c.branch} isn't one of the eBay branches (add it on the Assignments tab to list from it)`}
                               className={`rounded-full border px-2 py-0.5 tabular-nums transition-colors disabled:opacity-40 ${active ? "border-blue-400 bg-blue-500/25 text-blue-100" : c.available > 0 ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20" : "border-white/15 text-muted-foreground hover:bg-white/10"}`}
                             >
-                              {c.branch} · {c.available} free{c.onEbay ? ` (${c.onEbay} listed)` : ""}
+                              {c.branch} · {c.available} free{c.onEbay ? ` (${c.onEbay} listed)` : ""}{c.ebayStock ? " · eBay stock" : ""}
                             </button>
                           );
                         })
@@ -2579,10 +2601,25 @@ export function PartsDailyReportEbay({ mod, sub }: { mod: ModuleDef; sub: SubMod
                               <span className="text-muted-foreground">…</span>
                             ) : (() => {
                               const m = stockMatchFor(l);
-                              return m ? (
-                                <span className="text-emerald-300" title={`${m.branch} ${m.partNo} — ${m.quantity} on the Truck Stock row; this listing shows there as On eBay`}>{m.quantity} in stock</span>
-                              ) : (
-                                <span className="text-amber-300" title={stockLoadError ? "Truck Stock couldn't be loaded" : `No Truck Stock row for ${l.partNo || "this part"} at ${l.branch} — selling it won't change Truck Stock`}>Not in Truck Stock</span>
+                              if (m && !m.elsewhere) {
+                                return <span className="text-emerald-300" title={`${m.branch} ${m.partNo} — ${m.quantity} on the Truck Stock row; this listing shows there as On eBay`}>{m.quantity} in stock</span>;
+                              }
+                              if (m) {
+                                return (
+                                  <span className="text-emerald-300" title={`No ${l.partNo} row at ${l.branch}; the unit set aside for eBay is ${m.branch}'s EBAY row (${m.quantity}). Selling takes it off there.`}>
+                                    {m.quantity} at {m.branch} <span className="text-muted-foreground">(eBay stock)</span>
+                                  </span>
+                                );
+                              }
+                              const elsewhere = stockElsewhereText(l);
+                              return (
+                                <span
+                                  className="text-amber-300"
+                                  title={stockLoadError ? "Truck Stock couldn't be loaded" : `No Truck Stock row for ${l.partNo || "this part"} at ${l.branch}${elsewhere ? ` — in stock at ${elsewhere}. If it ships from one of those, edit the listing's branch.` : ""} Selling it won't change Truck Stock.`}
+                                >
+                                  {elsewhere ? `Not at ${l.branch}` : "Not in Truck Stock"}
+                                  {elsewhere ? <span className="block max-w-[220px] truncate text-[10px] text-muted-foreground">at {elsewhere}</span> : null}
+                                </span>
                               );
                             })()}
                           </td>
@@ -2978,7 +3015,8 @@ export function PartsDailyReportEbay({ mod, sub }: { mod: ModuleDef; sub: SubMod
                 <span className="font-mono">{row.partNo}</span> · {row.branch} · Qty {row.quantity}
               </p>
               <p className="mt-3 text-sm text-slate-300">
-                Truck Stock has <span className="font-semibold text-white">{match.quantity}</span> at {match.branch}. Selling takes{" "}
+                Truck Stock has <span className="font-semibold text-white">{match.quantity}</span> at {match.branch}
+                {match.elsewhere ? ` (its eBay stock — there's no ${row.partNo} row at ${row.branch})` : ""}. Selling takes{" "}
                 <span className="font-semibold text-white">{take}</span> off ({match.quantity} → {match.quantity - take}).
               </p>
               <div className="mt-5 flex flex-col gap-2">
