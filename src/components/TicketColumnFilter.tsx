@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Filter } from "lucide-react";
+import { placeColumnFilterDropdown } from "@/lib/columnFilterPlacement";
 
 interface Props {
   /** Distinct option values present in the column right now (after every OTHER filter). */
@@ -45,15 +46,23 @@ export function TicketColumnFilter({ options, selected, onChange, label, classNa
   // only 1-2 tickets match the filters). Portal the dropdown to <body> and
   // position it with fixed coords from the button's rect so it always has
   // room to render regardless of how few rows the table currently has.
+  // Kept inside the window: on a column near the right edge (e.g. the Ticket
+  // List's last column, Posting) it lines up with the funnel's right side
+  // instead of running off screen, and near the bottom it opens upward.
   const updatePos = useCallback(() => {
     if (!buttonRef.current) return;
     const rect = buttonRef.current.getBoundingClientRect();
-    setPos({ top: rect.bottom + 4, left: rect.left });
+    setPos(placeColumnFilterDropdown(rect, window.innerWidth, window.innerHeight, dropdownRef.current?.offsetHeight ?? 0));
   }, []);
 
   useLayoutEffect(() => {
     if (open) updatePos();
   }, [open, updatePos]);
+  // Once it's on screen its height is known — place it again (opens upward when there's no room below).
+  const shown = open && pos !== null;
+  useLayoutEffect(() => {
+    if (shown) updatePos();
+  }, [shown, updatePos]);
 
   // Close on outside click / escape.
   useEffect(() => {
