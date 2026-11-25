@@ -6,8 +6,11 @@
  * / Open — never Claimed, Completed, Cancelled or Rejected) from the chosen
  * sources (e.g. GE, SQUARE TRADE, ELECTROLUX) that aren't tickets in AHS
  * yet are added. Same rules as the Data Migration button: a ticket already
- * in AHS is never changed (re-updating one from ServicePower overwrote its
- * technician and cleared its check-ins).
+ * in AHS is never re-pulled (re-updating one from ServicePower overwrote its
+ * technician and cleared its check-ins) — instead its EMPTY fields are
+ * filled from the call (model, serial, purchase date, address, problem …;
+ * servicePowerFillBlank.ts), each one only while it's still empty. Status,
+ * technician, schedule and check-ins are never touched.
  *
  * Each run looks at calls received in the last AUTO_PULL_LOOKBACK_DAYS days
  * (never before settings.from), so a call that only turns Accepted a few
@@ -25,6 +28,7 @@ import { parseGetCallInfoResponse } from "../servicePowerSoapParser";
 import { convertCallToTicket, isOpenCall } from "../servicePowerSync";
 import { clearZipCoverageOverrides, registerZipCoverage } from "../zipCoverage";
 import { buildServicePowerPayloads, parseScheduleDateForSql } from "../servicePowerPayloads";
+import { planFillBlank, stillBlankFilter, type FillChange } from "../servicePowerFillBlank";
 import {
   autoPullWindows,
   centralTodayIso,
@@ -45,6 +49,10 @@ export interface SpAutoPullCompanyResult {
   added: string[];
   /** Dry run only: what would have been added. */
   wouldAdd: Array<{ ticketNo: string; source: string; callDate: string; branch: string; status: string }>;
+  /** Tickets already in AHS whose empty fields were filled from the call (columns filled). */
+  filled: Array<{ ticketNo: string; columns: string[] }>;
+  /** Dry run only: what would have been filled. */
+  wouldFill: Array<{ ticketNo: string; columns: string[] }>;
   errors: string[];
 }
 
@@ -130,6 +138,30 @@ async function existingTicketNos(ctx: Ctx, companyId: string, ticketNos: string[
   return found;
 }
 
+/** The tickets rows (customer joined) for these ticket numbers — for filling their empty fields. */
+async function existingTicketRows(ctx: Ctx, companyId: string, ticketNos: string[]): Promise<Map<string, any>> {
+  const out = new Map<string, any>();
+  for (let i = 0; i < ticketNos.length; i += 100) {
+    const chunk = ticketNos.slice(i, i + 100);
+    const rows = await rest<any[]>(
+      ctx,
+      `tickets?select=*,customer:customers(*)&company_id=eq.${companyId}&ticket_no=in.${encodeURIComponent(inList(chunk))}`,
+    );
+    for (const r of rows) out.set(String(r.ticket_no).trim(), r);
+  }
+  return out;
+}
+
+/** One fill: written only while the column is still empty. true when it was written. */
+async function applyFill(ctx: Ctx, change: FillChange): Promise<boolean> {
+  const rows = await rest<unknown[]>(ctx, `${change.table}?id=eq.${change.id}&${stillBlankFilter(change.column)}&select=id`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({ [change.column]: change.value }),
+  });
+  return Array.isArray(rows) && rows.length > 0;
+}
+
 /** Adds one ticket (customer first). "exists" when someone added it a moment ago. */
 async function insertNewTicket(ctx: Ctx, companyId: string, input: ReturnType<typeof convertCallToTicket>): Promise<{ outcome: "added" | "exists"; ticketId?: string }> {
   const ticketNo = String(input.ticketNo ?? "").trim();
@@ -191,6 +223,8 @@ async function pullForCompany(
     alreadyInAhs: 0,
     added: [],
     wouldAdd: [],
+    filled: [],
+    wouldFill: [],
     errors: [],
   };
   if (result.windows.length === 0) return result;
@@ -220,6 +254,36 @@ async function pullForCompany(
   const existing = await existingTicketNos(ctx, companyId, matching.map((t) => String(t.ticketNo).trim()));
   const missing = matching.filter((t) => !existing.has(String(t.ticketNo).trim()));
   result.alreadyInAhs = matching.length - missing.length;
+
+  // Already in AHS (e.g. from the bulk import): fill their empty fields from the call.
+  const inAhs = matching.filter((t) => existing.has(String(t.ticketNo).trim()));
+  if (inAhs.length > 0) {
+    try {
+      const rows = await existingTicketRows(ctx, companyId, inAhs.map((t) => String(t.ticketNo).trim()));
+      for (const t of inAhs) {
+        const ticketNo = String(t.ticketNo).trim();
+        const row = rows.get(ticketNo);
+        if (!row) continue;
+        const changes = planFillBlank(row, t);
+        if (changes.length === 0) continue;
+        if (!opts.apply) {
+          result.wouldFill.push({ ticketNo, columns: changes.map((c) => c.column) });
+          continue;
+        }
+        const columns: string[] = [];
+        for (const change of changes) {
+          try {
+            if (await applyFill(ctx, change)) columns.push(change.column);
+          } catch (err) {
+            result.errors.push(`${ticketNo} ${change.column}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+        if (columns.length > 0) result.filled.push({ ticketNo, columns });
+      }
+    } catch (err) {
+      result.errors.push(`filling tickets already in AHS: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   const logRows: Record<string, unknown>[] = [];
   for (const t of missing) {

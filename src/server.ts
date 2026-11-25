@@ -406,8 +406,9 @@ export default {
     );
 
     // ServicePower auto-pull: open calls from the chosen sources (e.g. GE,
-    // SQUARE TRADE, ELECTROLUX) that aren't tickets yet are added — never
-    // changes an existing ticket. Only companies that turned it on
+    // SQUARE TRADE, ELECTROLUX) that aren't tickets yet are added; ones already
+    // in AHS only get their EMPTY fields filled (never status / technician /
+    // schedule / check-ins). Only companies that turned it on
     // (companies.settings.spAutoPull, migration 0475); see servicePowerAutoPull.ts.
     ctx.waitUntil(
       import("./lib/server/servicePowerAutoPull").then(
@@ -419,7 +420,7 @@ export default {
               companies: result.companies,
               added: result.added,
               errors: result.errors,
-              perCompany: result.results.map((r) => ({ companyId: r.companyId, calls: r.calls, matching: r.matching, alreadyInAhs: r.alreadyInAhs, added: r.added })),
+              perCompany: result.results.map((r) => ({ companyId: r.companyId, calls: r.calls, matching: r.matching, alreadyInAhs: r.alreadyInAhs, added: r.added, filled: r.filled })),
             }));
           }
         },
